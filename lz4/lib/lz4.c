@@ -1155,6 +1155,142 @@ int LZ4_saveDict (LZ4_stream_t* LZ4_dict, char* safeBuffer, int dictSize)
 }
 
 
+LZ4_FORCE_O2_GCC_PPC64LE
+int LZ4_decomplress_onthefly(ReadFp reader, void* ctx, size_t srcSize, char* dst, int maxOutputSize)
+{
+    uint8_t* op = (uint8_t*)dst;
+    uint8_t* const oend = op + maxOutputSize;
+
+    size_t readLen = 0;
+    ssize_t ret;
+
+    for (; readLen < srcSize; ) {
+        /*
+          The first field uses the 4 high-bits of the token. It provides
+          the length of literals to follow.
+
+          If the field value is 0, then there is no literal. If it is 15,
+          then we need to add some more bytes to indicate the full
+          length. Each additional byte then represent a value from 0 to
+          255, which is added to the previous value to produce a total
+          length. When the byte value is 255, another byte is
+          output. There can be any number of bytes following the
+          token. There is no "size limit". (Side note : this is why a
+          not-compressible input block is expanded by 0.4%).
+        */
+        uint8_t token;
+        ret = reader(&token, sizeof(token), ctx);
+        if (ret != sizeof(token)) {
+            goto _error;
+        }
+        readLen += (size_t)ret;
+
+        size_t literalsLen = token >> 4;
+        if (literalsLen == 15) {
+            uint8_t b;
+            do {
+                ret = reader(&b, sizeof(b), ctx);
+                if (ret != sizeof(b)) {
+                    goto _error;
+                }
+                readLen += (size_t)ret;
+                literalsLen += b;
+            } while (b == 255);
+        }
+
+        /*
+          Following the token and optional length bytes, are the literals
+          themselves. They are exactly as numerous as previously decoded
+          (length of literals). It's possible that there are zero literal.
+        */
+        if (op + literalsLen > oend) {
+            // Error : write attempt beyond end of output buffer
+            goto _error;
+        }
+        if (literalsLen > 0) {
+            ret = reader(op, literalsLen, ctx);
+            if ((size_t)ret != literalsLen) {
+                goto _error;
+            }
+            readLen += (size_t)ret;
+            op += literalsLen;
+        }
+
+        if (readLen == srcSize) {
+            break;
+        }
+
+        /*
+          Following the literals is the match copy operation.
+
+          It starts by the offset. This is a 2 bytes value, in little
+          endian format (the 1st byte is the "low" byte, the 2nd one is
+          the "high" byte).
+
+          The offset represents the position of the match to be copied
+          from. 1 means "current position - 1 byte". The maximum offset
+          value is 65535, 65536 cannot be coded. Note that 0 is an invalid
+          value, not used.
+        */
+        uint16_t offset;
+        ret = reader(&offset, sizeof(offset), ctx);
+        if (ret != sizeof(offset)) {
+            goto _error;
+        }
+        readLen += (size_t)ret;
+        if (!LZ4_isLittleEndian()) {
+            offset = (offset << 8) | (offset >> 8);
+        }
+
+        const uint8_t* match = op - offset;
+        if (unlikely(match < (uint8_t*)dst)) {
+            goto _error;   /* Error : offset outside buffers */
+        }
+
+        /*
+          Then we need to extract the match length. For this, we use the
+          second token field, the low 4-bits. Value, obviously, ranges
+          from 0 to 15. However here, 0 means that the copy operation will
+          be minimal. The minimum length of a match, called minmatch, is
+          4. As a consequence, a 0 value means 4 bytes, and a value of 15
+          means 19+ bytes. Similar to literal length, on reaching the
+          highest possible value (15), we output additional bytes, one at
+          a time, with values ranging from 0 to 255. They are added to
+          total to provide the final match length. A 255 value means there
+          is another byte to read and add. There is no limit to the number
+          of optional bytes that can be output this way. (This points
+          towards a maximum achievable compression ratio of about 250).
+        */
+        size_t matchLen = token & 0xf;
+        if (matchLen == 15) {
+            uint8_t b;
+            do {
+                ret = reader(&b, sizeof(b), ctx);
+                if (ret != sizeof(b)) {
+                    goto _error;
+                }
+                readLen += (size_t)ret;
+                matchLen += b;
+            } while (b == 255);
+        }
+        matchLen += 4;
+
+        if (op + matchLen > oend) {
+            // Error : write attempt beyond end of output buffer
+            goto _error;
+        }
+
+        for (size_t i = 0; i < matchLen; ++i) {
+            *op++ = *match++;
+        }
+    } // for (;;)
+
+    return (int) (((char*)op) - dst);
+
+    /* Overflow error detected */
+_error:
+    return (int) (-(readLen) - 1);
+}
 
 /*-*****************************
 *  Decompression functions
@@ -1343,11 +1479,43 @@ _output_error:
     return (int) (-(((const char*)ip)-src))-1;
 }
 
+typedef struct {
+    const char* source;
+    int compressedSize;
+    int readSize;
+} LZ4_reader_context_t_internal;
+
+ssize_t LZ4_buf_reader(void* buf, size_t size, void* context)
+{
+    LZ4_reader_context_t_internal* ctx = (LZ4_reader_context_t_internal*)context;
+
+    const int remain = ctx->compressedSize - ctx->readSize;
+    const int cpySize = (int)size < remain ? (int)size : remain;
+
+    if (cpySize > 0) {
+        memcpy(buf, &ctx->source[ctx->readSize], cpySize);
+        ctx->readSize += cpySize;
+    }
+    return cpySize;
+}
 
 LZ4_FORCE_O2_GCC_PPC64LE
 int LZ4_decompress_safe(const char* source, char* dest, int compressedSize, int maxDecompressedSize)
 {
+    /*
+      lz4bspatch doesn't use this function.
+      To make LZ4 unit test check LZ4_decomplress_onthefly(), replaced call function with it.
+    */
+#if 0
     return LZ4_decompress_generic(source, dest, compressedSize, maxDecompressedSize, endOnInputSize, full, 0, noDict, (BYTE*)dest, NULL, 0);
+#else
+    LZ4_reader_context_t_internal ctx = {
+        .source = source,
+        .compressedSize = compressedSize,
+        .readSize = 0,
+    };
+    return LZ4_decomplress_onthefly(LZ4_buf_reader, &ctx, compressedSize, dest, maxDecompressedSize);
+#endif
 }
 
 LZ4_FORCE_O2_GCC_PPC64LE

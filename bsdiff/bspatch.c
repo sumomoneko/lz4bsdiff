@@ -94,6 +94,85 @@ int bspatch(const uint8_t* old, int64_t oldsize, uint8_t* new, int64_t newsize, 
 	return 0;
 }
 
+int bspatch_with_stream(const uint8_t* old, int64_t oldsize, struct bspatch_stream_ex* stream)
+{
+	int64_t oldpos;
+	int64_t ctrl[3];
+	int64_t i;
+
+	oldpos=0;
+	for (;;) {
+		/* Read control data */
+		for(i=0;i<=2;i++) {
+            uint8_t buf[8];
+			if (stream->read(stream, buf, 8)) {
+                // end
+				return 0;
+            }
+			ctrl[i]=offtin(buf);
+		};
+
+		/* Sanity-check */
+        // https://android.googlesource.com/platform/external/bsdiff/+/4d054795b673855e3a7556c6f2f7ab99ca509998%5E!/
+        if (ctrl[0] < 0 || ctrl[1] < 0) {
+            // malformed
+            return -1;
+        }
+
+        /* read diff and apply */
+        {
+            int64_t remain = ctrl[0];
+            for (int64_t nowread = 0; remain > 0; remain -= nowread) {
+
+                uint8_t* buf;
+                nowread = stream->peep(stream, (void**)&buf, (int)remain);
+                if (nowread <= 0) {
+                    return -1;
+                }
+
+                /* Add old data to diff string */
+                for( i = 0; i < nowread; i++) {
+                    if((oldpos+i>=0) && (oldpos+i<oldsize)) {
+                        buf[i] += old[oldpos+i];
+                    }
+                }
+
+                // save.
+                if (stream->write(stream, buf, (int)nowread) < 0) {
+                    return -1;
+                }
+
+                /* Adjust pointers */
+                oldpos += nowread;
+            }
+        }
+
+
+		/* Read extra string and insert */
+        {
+            int64_t remain = ctrl[1];
+            for (int64_t nowread = 0; remain > 0; remain -= nowread) {
+                uint8_t* buf;
+                /* Read diff string */
+                nowread = stream->peep(stream, (void**)&buf, (int)remain);
+                if (nowread <= 0) {
+                    return -1;
+                }
+
+                if (stream->write(stream, buf, (int)nowread) < 0) {
+                    return -1;
+                }
+            }
+        }
+
+		/* Adjust pointers */
+		oldpos+=ctrl[2];
+	};
+
+	return 0;
+}
+
+
 #if defined(BSPATCH_EXECUTABLE)
 
 #include <bzlib.h>

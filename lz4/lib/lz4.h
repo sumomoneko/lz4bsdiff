@@ -41,7 +41,7 @@ extern "C" {
 
 /* --- Dependency --- */
 #include <stddef.h>   /* size_t */
-
+#include <unistd.h>   /* ssize_t */
 
 /**
   Introduction
@@ -149,6 +149,9 @@ LZ4LIB_API int LZ4_compress_default(const char* src, char* dst, int srcSize, int
 */
 LZ4LIB_API int LZ4_decompress_safe (const char* src, char* dst, int compressedSize, int dstCapacity);
 
+
+typedef ssize_t (*ReadFp)(void* buf, size_t size, void* context);
+LZ4LIB_API int LZ4_decomplress_onthefly(ReadFp reader, void* context, size_t srcSize, char* dst, int maxOutputSize);
 
 /*-************************************
 *  Advanced Functions
